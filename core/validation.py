@@ -28,3 +28,4 @@ def validate_bucket_index(bucket: int, min_bucket: int = 0, max_bucket: int = 19
         raise ValueError(f"Bucket index {bucket} is invalid: must be <= {max_bucket}")
     
     return bucket
+

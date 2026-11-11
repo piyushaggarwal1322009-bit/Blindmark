@@ -53,3 +53,4 @@ If an identity token is directly attached to the cryptographic report upload, an
    * Before displaying bucket bars (e.g., *Bucket 5: 14 responses*), the collector samples calibrated discrete Laplacian noise:
      $$\tilde{C}_i = \max\left(0, \text{Round}(C_i + \text{Laplace}(0, 1/\epsilon))\right)$$
    * This provides mathematical $(\epsilon, \delta)$-differential privacy, ensuring that an adversary cannot determine with confidence whether any specific individual participated or changed buckets.
+

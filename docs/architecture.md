@@ -131,3 +131,4 @@ To support multiple communities and recurring compensation benchmarks, the appli
 
 **Database Invariant:**
 No table in the database contains `share_0`, `share_1`, raw scalar salary, or user identity references in the same record as submission payloads.
+
