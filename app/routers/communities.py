@@ -4,11 +4,16 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Community
 from app.schemas import CommunityCreate, CommunityResponse
+from app.auth import require_admin, AuthPrincipal
 
 router = APIRouter(prefix="/api/communities", tags=["Communities"])
 
 @router.post("", response_model=CommunityResponse, status_code=status.HTTP_201_CREATED)
-def create_community(payload: CommunityCreate, db: Session = Depends(get_db)):
+def create_community(
+    payload: CommunityCreate,
+    db: Session = Depends(get_db),
+    admin: AuthPrincipal = Depends(require_admin)
+):
     existing = db.query(Community).filter(Community.name == payload.name).first()
     if existing:
         raise HTTPException(
@@ -34,4 +39,3 @@ def get_community(community_id: str, db: Session = Depends(get_db)):
             detail=f"Community '{community_id}' not found."
         )
     return community
-

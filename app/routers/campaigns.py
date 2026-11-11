@@ -3,20 +3,30 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models import Campaign, Community, AggregationResult
+from app.models import Campaign, Community, AggregationResult, CampaignEligibility
 from app.schemas import (
     CampaignCreate, CampaignResponse,
+    EligibilityRegisterRequest, EligibilityRegisterResponse,
     TokenIssueRequest, TokenIssueResponse,
     TokenRedeemRequest, TokenRedeemResponse,
     ResultReleaseRequest, ResultResponse
 )
-from app.services.token_service import issue_campaign_token, redeem_campaign_token
+from app.services.token_service import (
+    issue_campaign_token, redeem_campaign_token, register_campaign_eligibility
+)
 from app.services.release_policy import DevelopmentReleasePolicy
+from app.auth import require_admin, require_aggregator, AuthPrincipal
+from core.validation import validate_bucket_index
 
 router = APIRouter(prefix="/api/campaigns", tags=["Campaigns"])
 
+# Campaign Creation (Protected: Admin Only)
 @router.post("", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-def create_campaign(payload: CampaignCreate, db: Session = Depends(get_db)):
+def create_campaign(
+    payload: CampaignCreate,
+    db: Session = Depends(get_db),
+    admin: AuthPrincipal = Depends(require_admin)
+):
     community = db.query(Community).filter(Community.id == payload.community_id).first()
     if not community:
         raise HTTPException(
@@ -55,6 +65,7 @@ def create_campaign(payload: CampaignCreate, db: Session = Depends(get_db)):
     db.refresh(campaign)
     return campaign
 
+# Campaign Listing (Public metadata)
 @router.get("", response_model=List[CampaignResponse])
 def list_campaigns(community_id: Optional[str] = None, db: Session = Depends(get_db)):
     query = db.query(Campaign)
@@ -62,6 +73,7 @@ def list_campaigns(community_id: Optional[str] = None, db: Session = Depends(get
         query = query.filter(Campaign.community_id == community_id)
     return query.all()
 
+# Campaign Retrieval (Public metadata)
 @router.get("/{campaign_id}", response_model=CampaignResponse)
 def get_campaign(campaign_id: str, db: Session = Depends(get_db)):
     campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
@@ -72,7 +84,27 @@ def get_campaign(campaign_id: str, db: Session = Depends(get_db)):
         )
     return campaign
 
-# Token Issuance Endpoint
+# Participant Eligibility Registration (Protected: Admin Only)
+@router.post("/{campaign_id}/eligibility", response_model=EligibilityRegisterResponse, status_code=status.HTTP_201_CREATED)
+def register_eligibility(
+    campaign_id: str,
+    payload: EligibilityRegisterRequest,
+    db: Session = Depends(get_db),
+    admin: AuthPrincipal = Depends(require_admin)
+):
+    try:
+        eligibility = register_campaign_eligibility(db, campaign_id, payload.participant_ref)
+        return EligibilityRegisterResponse(
+            campaign_id=campaign_id,
+            participant_ref=eligibility.participant_ref,
+            token_issued=eligibility.token_issued,
+            registered=True,
+            message="Participant reference successfully registered as eligible."
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+# Token Issuance Endpoint (Available to registered participants)
 @router.post("/{campaign_id}/tokens/issue", response_model=TokenIssueResponse)
 def issue_token(campaign_id: str, payload: TokenIssueRequest, db: Session = Depends(get_db)):
     try:
@@ -100,12 +132,38 @@ def redeem_token(campaign_id: str, payload: TokenRedeemRequest, db: Session = De
             detail=str(e)
         )
 
-# Submit & Evaluate Results Endpoint
+# Submit & Evaluate Results Endpoint (Protected: Trusted Aggregator Only)
 @router.post("/{campaign_id}/results/evaluate", response_model=ResultResponse)
-def evaluate_results(campaign_id: str, payload: ResultReleaseRequest, db: Session = Depends(get_db)):
+def evaluate_results(
+    campaign_id: str,
+    payload: ResultReleaseRequest,
+    db: Session = Depends(get_db),
+    aggregator: AuthPrincipal = Depends(require_aggregator)
+):
     campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
     if not campaign:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
+
+    # Strict input validation: histogram length and values
+    expected_buckets = len(campaign.bucket_configuration)
+    if len(payload.histogram) != expected_buckets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Histogram dimension mismatch: campaign defines {expected_buckets} buckets, received {len(payload.histogram)}."
+        )
+
+    # Validate each bucket count using validation logic
+    for i, count in enumerate(payload.histogram):
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Bucket {i} count must be an integer, got {type(count).__name__}."
+            )
+        if count < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Bucket {i} count cannot be negative: {count}."
+            )
 
     status_str, sanitized_hist, msg = DevelopmentReleasePolicy.evaluate_release(
         campaign, payload.histogram, payload.participant_count
@@ -132,7 +190,7 @@ def evaluate_results(campaign_id: str, payload: ResultReleaseRequest, db: Sessio
         message=msg
     )
 
-# Retrieve Campaign Results Endpoint
+# Retrieve Campaign Results Endpoint (Public, only returns released data)
 @router.get("/{campaign_id}/results", response_model=ResultResponse)
 def get_campaign_results(campaign_id: str, db: Session = Depends(get_db)):
     campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
@@ -163,4 +221,3 @@ def get_campaign_results(campaign_id: str, db: Session = Depends(get_db)):
         released_at=result.released_at,
         message="Verified aggregate benchmark release."
     )
-

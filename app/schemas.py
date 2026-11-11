@@ -1,9 +1,10 @@
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # Community Schemas
 class CommunityCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str = Field(..., min_length=2, max_length=100)
     description: Optional[str] = None
 
@@ -18,6 +19,7 @@ class CommunityResponse(BaseModel):
 
 # Campaign Schemas
 class CampaignCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     community_id: str
     title: str = Field(..., min_length=3, max_length=200)
     description: Optional[str] = None
@@ -43,8 +45,22 @@ class CampaignResponse(BaseModel):
     created_at: datetime
 
 
+# Participant Eligibility Schemas
+class EligibilityRegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    participant_ref: str = Field(..., min_length=3, max_length=128)
+
+class EligibilityRegisterResponse(BaseModel):
+    campaign_id: str
+    participant_ref: str
+    token_issued: bool
+    registered: bool
+    message: str
+
+
 # Token Schemas
 class TokenIssueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     participant_ref: str = Field(..., min_length=3, max_length=128)
 
 class TokenIssueResponse(BaseModel):
@@ -53,6 +69,7 @@ class TokenIssueResponse(BaseModel):
     note: str = "Store this token securely. It cannot be recovered and will be invalidated upon single use."
 
 class TokenRedeemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     token: str = Field(..., min_length=16)
 
 class TokenRedeemResponse(BaseModel):
@@ -63,9 +80,21 @@ class TokenRedeemResponse(BaseModel):
 
 # Result Schemas
 class ResultReleaseRequest(BaseModel):
-    # Simulated aggregate shares or unshared histogram for testing/release
+    model_config = ConfigDict(extra="forbid")
     histogram: List[int]
-    participant_count: int
+    participant_count: int = Field(..., ge=1)
+
+    @field_validator("histogram")
+    @classmethod
+    def validate_histogram_counts(cls, v: List[int]) -> List[int]:
+        if not v:
+            raise ValueError("Histogram cannot be empty.")
+        for count in v:
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise ValueError(f"Histogram bucket count must be an integer, got {type(count).__name__}")
+            if count < 0:
+                raise ValueError(f"Histogram count cannot be negative: got {count}")
+        return v
 
 class ResultResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -77,4 +106,3 @@ class ResultResponse(BaseModel):
     release_status: str
     released_at: Optional[datetime] = None
     message: Optional[str] = None
-
