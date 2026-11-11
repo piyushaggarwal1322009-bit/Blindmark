@@ -1,7 +1,7 @@
 # Blindmark — Phase 6A: VDAF Research & Protocol Analysis
 
-**Document Status:** Research & Architecture Specification  
-**Scope:** VDAF (draft-irtf-cfrg-vdaf), DAP (draft-ietf-ppm-dap), Rust `libprio-rs`, Divvi Up `janus`, and Cloudflare `daphne`.
+**Document Status:** Research & Specification Analysis (Updated with Precise Version Findings)  
+**Scope:** VDAF (`draft-irtf-cfrg-vdaf`), DAP (`draft-ietf-ppm-dap`), Rust `libprio-rs`, Divvi Up `janus`.
 
 ---
 
@@ -21,80 +21,27 @@
   > *"This repository contains a reference implementation of VDAFs... It is not intended for production use. It is neither fast nor secure against side-channel attacks."*
 - **No Transport or Replay Defense:** The Python POC lacks Hybrid Public Key Encryption (HPKE) report envelopes, task authorization, or aggregator-to-aggregator state synchronization.
 
-### Reusable vs. Replaceable Components
-| Component | Status | Action |
-| :--- | :--- | :--- |
-| `experiments/*.py` | Reference POC | **Retain as historical test fixtures.** Do not use in production runtime. |
-| `app/models.py` & PostgreSQL schema | Foundation | **Reusable.** Community and Campaign metadata models directly map to DAP tasks. |
-| `app/services/token_service.py` | Scaffold | **Replace/Upgrade.** The current single-server nullifier token must transition to DAP report replay tracking and/or client-side anonymous credential issuance. |
-| `app/services/vdaf_interface.py` | Abstract Interface | **Upgrade.** Maps directly to DAP aggregator API endpoints. |
-| `app/services/release_policy.py` | Threshold Policy | **Reusable.** Must gate DAP collector query releases behind $N \ge \text{minimum\_participants}$. |
-
 ---
 
-## 2. Protocol Analysis: VDAF vs. DAP
+## 2. Protocol & Implementation Compatibility Matrix
 
-### 2.1 Verifiable Distributed Aggregation Functions (VDAF)
-- **Specification:** [draft-irtf-cfrg-vdaf-22](https://datatracker.ietf.org/doc/draft-irtf-cfrg-vdaf/) (IRTF CFRG)
-- **Role:** Pure cryptographic layer (zero-knowledge proofs, secret sharing, finite-field arithmetic).
-- **Core Abstractions:**
-  - `shard(measurement)` $\to$ `(public_share, [input_share_1, input_share_2])`
-  - `prep(aggregator_id, input_share, ...)` $\to$ `(prep_state, prep_msg)`
-  - `prep_finish(prep_state, prep_shares)` $\to$ `aggregate_share`
-  - `unshard(agg_param, [agg_share_1, agg_share_2])` $\to$ `aggregate_result`
-
-### 2.2 Distributed Aggregation Protocol (DAP)
-- **Specification:** [draft-ietf-ppm-dap-20](https://datatracker.ietf.org/doc/draft-ietf-ppm-dap/) (IETF PPM Working Group)
-- **Role:** End-to-end distributed system and wire protocol that operationalizes VDAFs across the internet.
-- **What DAP Adds on Top of VDAF:**
-  1. **HPKE Envelope Encryption:** Client encrypts `input_share_1` with Leader's public key and `input_share_2` with Helper's public key using Hybrid Public Key Encryption (RFC 9180). Neither aggregator can read the other's share.
-  2. **Task Coordination:** Formalizes `task_id`, query types, epoch windows, and aggregation parameters.
-  3. **Aggregator Protocol:** HTTP endpoints over TLS for the Leader to drive the multi-round aggregation jobs with the Helper (`/aggregate`, `/aggregate_shares`).
-  4. **Collector Protocol:** Collector requests batch results from Leader and Helper, decrypts or combines partial aggregate shares, and receives the final metric.
-  5. **Replay & Batching Protection:** Strict report deduplication within batch windows to prevent malicious clients from submitting identical shares multiple times.
-
----
-
-## 3. Protocol Implementation Repositories
-
-| Repository | Current Version | Draft Targets | License | Architecture & Limitations |
+| Component | Repository | Tested / Target Version | Upstream Draft Standards | Status & Limitations |
 | :--- | :--- | :--- | :--- | :--- |
-| **`divviup/libprio-rs`** | Latest Git / Crates.io | `draft-irtf-cfrg-vdaf-22` | MPL-2.0 | Pure Rust cryptographic library. Implements `Prio3Histogram`, `Prio3Sum`, `Prio3Count`. Production-grade speed; constant-time operations; no network or server code. |
-| **`divviup/janus`** | Active (Release branches track draft revisions) | `draft-ietf-ppm-dap-19/20` | MPL-2.0 | Full production DAP implementation in Rust by Divvi Up / ISRG. Modular crates (`janus_aggregator`, `janus_client`, `janus_collector`, `janus_core`). Requires PostgreSQL backend per aggregator. Native support for `Prio3Histogram`. |
-| **`cloudflare/daphne`** | Active | `draft-ietf-ppm-dap-19/20` | BSD-3-Clause | DAP implementation designed for Cloudflare Workers / serverless runtime. Excellent, but tightly coupled to Cloudflare ecosystem primitives (KV/D1). |
+| **VDAF Cryptographic Core** | `divviup/libprio-rs` (Crate `prio`) | `0.18.1-alpha.3` | `draft-irtf-cfrg-vdaf-11` through `-22` | **Active, Pre-Release Alpha.** Native support for `Prio3Histogram`, `Prio3Sum`, `Prio3Count`. MPL-2.0 license. Does not have a formal third-party audit report linked in repo; side-channel risks on non-x86_64 require attention. |
+| **DAP Aggregator & Engine** | `divviup/janus` | Workspace `0.8+` (branch `release/0.8` or `main`) | `draft-ietf-ppm-dap-19/20` | **Experimental / Active Development.** The README explicitly states: *"Experimental implementation of the DAP specification... currently in active development."* Supports VDAFs with trivial aggregation parameters (`Prio3`). Does NOT support nontrivial aggregation parameters (`Mastic`). |
+| **DAP Client** | `janus_client` | Sub-crate in `janus` | `draft-ietf-ppm-dap-19/20` | Generates HPKE encrypted reports. Suitable for CLI and integration harnesses; browser clients typically require Wasm compilation. |
+| **DAP Collector** | `janus_collector` | Sub-crate in `janus` | `draft-ietf-ppm-dap-19/20` | Creates collection jobs on the Leader, retrieves Leader and Helper aggregate shares from Leader, decrypts, and unshares. |
 
 ---
 
-## 4. Conceptual Mechanics of Prio3Histogram
+## 3. Detailed DAP Workflow Mechanics
 
-```
-[ Client ]
-   |  Measurement: Bucket Index (e.g., 3 out of 10)
-   |  Vector: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0] (One-Hot)
-   |  Generates FLP Proof that vector has exactly one '1' and rest '0's
-   |  Splits vector & proof into 2 additive shares over finite field GF(2^31 - 1)
-   |  Encrypts Share A with Leader HPKE Key, Share B with Helper HPKE Key
-   |
-   +---------------------------------------+
-   | (Leader Report Share)                 | (Helper Report Share)
-   v                                       v
-[ Leader Aggregator ]                   [ Helper Aggregator ]
-   |                                       |
-   |<====== Round 1: Verify Proofs =======>| (Verify FLP validity without learning inputs)
-   |                                       |
-   | Accumulates Share A                   | Accumulates Share B
-   |                                       |
-   +-------------------+-------------------+
-                       |
-                       v
-             [ Collector / Blindmark ]
-                       |
-                       +---> Unshard: Share A + Share B = Final Histogram
-```
-
-1. **Client Sharding:** The client selects one discrete bucket $b \in [0, K-1]$. It encodes $b$ as a length-$K$ vector $V$ where $V[b] = 1$ and $V[i] = 0$ for $i \ne b$. It generates an algebraic proof asserting:
-   $$\sum_{i=0}^{K-1} V[i] = 1 \quad \text{and} \quad V[i]^2 - V[i] = 0 \; \forall i$$
-2. **Proof Verification:** The Leader and Helper verify the proof interactively over finite fields. If a client attempts to submit an out-of-range bucket, multiple 1s, or a scalar like $10,000,000$, the polynomial equality fails and the report is discarded prior to aggregation.
-3. **Additive Unsharing:** When aggregators add valid shares across $M$ participants, the aggregate vectors satisfy:
-   $$A_{\text{final}} = \sum_{j=1}^M S_{A}^{(j)} + \sum_{j=1}^M S_{B}^{(j)} = \sum_{j=1}^M V^{(j)}$$
-   Each bucket contains the exact count of participants whose measurement landed in that bucket.
+In the official DAP specification (`draft-ietf-ppm-dap`):
+1. **Client to Leader:** Client produces `Report` with `encrypted_input_share_leader` and `encrypted_input_share_helper`, sending it to `POST /tasks/{task_id}/reports` on the Leader.
+2. **Leader to Helper:** Leader forwards the Helper's encrypted share during the `POST /tasks/{task_id}/aggregate` preparation request.
+3. **Helper to Leader:** Helper decrypts its share, computes the FLP proof step, and returns a preparation message.
+4. **Leader to Helper:** Leader finishes FLP verification, computes state, and exchanges round confirmation. Both aggregators update their local partial batch shares.
+5. **Collector to Leader:** When a batch window completes, Collector issues `POST /tasks/{task_id}/collection_jobs` to the Leader.
+6. **Leader to Helper:** Leader requests the Helper's encrypted aggregate share via `POST /tasks/{task_id}/aggregate_shares`. Helper validates the batch checksum, encrypts its aggregate share with the Collector's public key, and returns it to the Leader.
+7. **Leader to Collector:** Leader packages its own encrypted aggregate share and the Helper's encrypted aggregate share and returns them in the collection job response.
+8. **Collector Unshards:** Collector decrypts both aggregate shares using its private key, adds them over the finite field, and recovers the plaintext histogram.

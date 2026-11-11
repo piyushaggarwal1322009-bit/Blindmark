@@ -1,13 +1,14 @@
 # Blindmark — Phase 6A: Cryptographic Architecture & System Design
 
-**Document Status:** Architecture Design  
-**Application Target:** Internship Stipend & Compensation Benchmarking
+**Document Status:** Architecture Design (Validated & Protocol Corrected)  
+**Application Target:** Internship Stipend & Compensation Benchmarking  
+**Protocols:** VDAF (`draft-irtf-cfrg-vdaf`), DAP (`draft-ietf-ppm-dap`)
 
 ---
 
 ## 1. Initial Benchmark Measurement Model (Internship Stipends)
 
-### 1.1 Fixed Histogram Bucket Configuration
+### 1.1 Provisional Fixed Histogram Bucket Configuration
 For the initial benchmark, Blindmark establishes a 12-bucket monthly stipend histogram (USD equivalent):
 
 | Bucket Index | Monthly Stipend Range | Hourly Equivalent (40h/wk) |
@@ -25,117 +26,105 @@ For the initial benchmark, Blindmark establishes a 12-bucket monthly stipend his
 | **10** | $\$16,000 - \$19,999$ | $\$100.00 - \$124.99 / \text{hr}$ |
 | **11** | $\ge \$20,000$ | $\ge \$125.00 / \text{hr}$ |
 
-### 1.2 Mathematical & Cryptographic Parameters
+### 1.2 Measurement Parameters & Constraints
 - **VDAF Scheme:** `Prio3Histogram`
-- **Finite Field:** Field size $p = 2^{31} - 1$ (Mersenne 31 prime field `prio::field::FieldElement<Field31>`).
+- **Finite Field:** $p = 2^{31} - 1$ (Mersenne 31 prime field `prio::field::Field31`).
 - **Input Encoding:** One-hot vector of length $K = 12$.
 - **Chunk Length:** Default parallel sum gadget chunk size $C = 4$.
-- **Batch Window / Epoch:** Task collection window duration (e.g. 7 days or campaign duration).
-- **Minimum Cohort Threshold ($N_{\min}$):** Minimum $20$ distinct participant reports before collector unsharing is authorized.
+- **Why Bucket Configuration Must Be Fixed Per Task:**
+  In VDAF/Prio3, the proof verification polynomial structure and finite-field vector dimensions depend strictly on $K$. Aggregators cannot add shares from tasks with different bucket definitions or dynamic scales.
+- **Why Currency and Geography Must Be Chosen Before Launch:**
+  VDAF operates on abstract integers (one-hot vectors). It has no concept of currency conversion or location adjustment. Blending €3,000 with $3,000 or London stipends with Bangalore stipends produces invalid statistics. Every task must be pegged to an explicit currency, payment interval (monthly/hourly), and geographic market.
+- **Validity vs. Truthfulness:**
+  Zero-knowledge proof verification proves **only** that the submitted vector is a valid 1-hot vector within the discrete range $[0, 11]$. It does **NOT** prove that the user earned that stipend in the real world. A malicious client can submit a valid 1-hot report claiming $\$20,000/\text{mo}$ while earning minimum wage. Preventing false reporting requires community eligibility verification and social gating, not cryptography alone.
+- **Cohort Thresholds vs. Differential Privacy:**
+  Enforcing $M \ge 20$ (k-anonymity gate) ensures an aggregate is not published for small groups, but does **NOT** prevent differencing attacks across overlapping campaigns. Differential privacy requires injecting calibrated mathematical noise (Laplace/Gaussian) into the unshared distribution.
 
 ---
 
-## 2. Target System Architecture
+## 2. Corrected Target System Architecture (Standard DAP Protocol Flow)
+
+In compliance with the official IETF Distributed Aggregation Protocol (`draft-ietf-ppm-dap`), the Collector communicates **exclusively with the Leader** during collection jobs. The Collector never opens direct connections to the Helper; instead, the Leader coordinates aggregate share requests from the Helper and returns both encrypted shares to the Collector.
 
 ```mermaid
-flowchart TD
-    subgraph Client Tier
-        User[Participant Browser / App Client]
-    end
+sequenceDiagram
+    autonumber
+    actor Participant as Participant Client
+    participant Backend as Blindmark FastAPI
+    participant Leader as Leader Aggregator (Janus)
+    participant Helper as Helper Aggregator (Janus)
+    participant Collector as Blindmark Collector
 
-    subgraph Blindmark Application Tier
-        Backend[Blindmark FastAPI Backend]
-        DB[(Blindmark PostgreSQL)]
-    end
+    %% 1. Task Setup
+    Note over Backend,Helper: 1. Campaign & Task Provisioning
+    Backend->>Leader: Provision Task (Task ID, K=12, Prio3Histogram, Collector PubKey)
+    Backend->>Helper: Provision Task (Task ID, K=12, Prio3Histogram, Collector PubKey)
+    Participant->>Backend: Check Eligibility & Fetch Task Config + Aggregator HPKE Keys
 
-    subgraph DAP Aggregation Tier [Non-Colluding]
-        Leader[Leader Aggregator\nJanus Service]
-        Helper[Helper Aggregator\nJanus Service]
-        LeaderDB[(Leader PostgreSQL)]
-        HelperDB[(Helper PostgreSQL)]
-    end
+    %% 2. Sharding & Submission
+    Note over Participant,Leader: 2. Client Sharding & Report Upload
+    Participant->>Participant: Map Stipend -> Bucket (e.g. 5)<br/>Create 1-Hot Vector & FLP Proof<br/>Split into Share A + Share B<br/>HPKE-encrypt Share A (Leader) & Share B (Helper)
+    Participant->>Leader: POST /tasks/{task_id}/reports (Report with Encrypted Share A & B)
 
-    subgraph Collector Tier
-        Collector[Blindmark DAP Collector Service]
-    end
+    %% 3. Aggregation Protocol
+    Note over Leader,Helper: 3. Inter-Aggregator Verification (MPC)
+    Leader->>Helper: POST /tasks/{task_id}/aggregate (Forward Encrypted Share B & Public Share)
+    Helper->>Helper: Decrypt Share B, Compute FLP Verification State
+    Helper-->>Leader: Return Preparation Message
+    Leader->>Leader: Verify FLP Proof & Accumulate Valid Share A
+    Helper->>Helper: Accumulate Valid Share B
 
-    %% Campaign Metadata & Eligibility
-    Backend <-->|1. Manage Communities & Campaigns| DB
-    User -->|2. Request Campaign Eligibility & Task Metadata| Backend
-    Backend -.->|Provision DAP Task ID & Public HPKE Keys| Leader
-    Backend -.->|Provision DAP Task ID & Public HPKE Keys| Helper
+    %% 4. Collection Protocol (Standard DAP Flow)
+    Note over Collector,Helper: 4. Collection Job Execution (Via Leader)
+    Collector->>Leader: POST /tasks/{task_id}/collection_jobs (Query Batch)
+    Leader->>Helper: POST /tasks/{task_id}/aggregate_shares (Batch Selector & Checksum)
+    Helper->>Helper: Verify Batch & Encrypt Aggregate Share B (to Collector PubKey)
+    Helper-->>Leader: Return helper_encrypted_agg_share
+    Leader->>Leader: Encrypt Aggregate Share A (to Collector PubKey)
+    Leader-->>Collector: Return Collection Response (Leader & Helper Encrypted Shares)
 
-    %% Secret Sharing & Report Submission
-    User -->|3. Local Prio3 Sharding & HPKE Encryption| User
-    User -->|4. DAP Upload Report: Encrypted Share A + Encrypted Share B| Leader
-
-    %% Inter-Aggregator MPC Verification
-    Leader <-->|Leader State| LeaderDB
-    Helper <-->|Helper State| HelperDB
-    Leader <-->|5. Inter-Aggregator Prep Protocol: Verify Proofs without learning inputs| Helper
-
-    %% Collection & Publication
-    Collector -->|6. Query Batch Aggregate Share A| Leader
-    Collector -->|7. Query Batch Aggregate Share B| Helper
-    Collector -->|8. Verify N >= N_min & Combine Shares| Collector
-    Collector -->|9. Post Released Histogram| Backend
-    Backend -->|10. Store Benchmark Distribution & Present to Community| DB
+    %% 5. Unsharding & Publication
+    Note over Collector,Backend: 5. Unsharding & Benchmark Release
+    Collector->>Collector: Check N >= 20 Threshold<br/>Decrypt Share A + Share B<br/>Combine over Field31: H = Share A + Share B
+    Collector->>Backend: POST /api/campaigns/{id}/results/evaluate (with X-Service-Key)
+    Backend->>Backend: Store Verified Histogram & Present Benchmark to Community
 ```
 
 ---
 
-## 3. Tier Responsibilities & Separation of Concerns
+## 3. Tier Responsibilities
 
 ### A. Client Tier (Browser / Desktop Application)
-- **Local Secret Sharding:** Runs WebAssembly (Wasm) compiled from `libprio-rs` / `janus_client`.
-- Maps user stipend input into single bucket $b \in [0, 11]$.
-- Encodes vector $V \in \{0, 1\}^{12}$ where $V[b] = 1$.
-- Generates FLP validity proof.
-- Encrypts `input_share_1` using Leader's HPKE public key, and `input_share_2` using Helper's HPKE public key.
-- Dispatches DAP `Report` payload to the Leader aggregator over HTTPS.
-- **Privacy Invariant:** Raw dollar stipend and bucket selection never leave the client's local memory.
+- Computes local stipend bracket $b \in [0, 11]$.
+- Constructs length-12 one-hot vector and Prio3 proof.
+- Creates DAP Report envelope:
+  - `encrypted_input_share_leader` (encrypted under Leader HPKE public key).
+  - `encrypted_input_share_helper` (encrypted under Helper HPKE public key).
+- Sends full report directly to the **Leader**.
 
-### B. Leader Aggregator Tier (Independent Organization 1)
-- Receives DAP reports from clients.
-- Enforces batch window and report deduplication.
-- Drives the DAP verification protocol with the Helper.
-- Accumulates verified `input_share_1` into its local running aggregate share.
-- Maintains zero access to `input_share_2`.
+### B. Leader Aggregator Tier (Janus Instance 1)
+- Ingests incoming DAP reports.
+- Forwards `encrypted_input_share_helper` to Helper over TLS.
+- Exchanges preparation messages with Helper to verify FLP proofs without learning measurement values.
+- Accumulates verified Share A into its batch state.
+- Receives collection job requests from Collector, fetches encrypted Share B from Helper, packages both encrypted shares, and returns them to the Collector.
 
-### C. Helper Aggregator Tier (Independent Organization 2)
-- Exposes authenticated HTTPS endpoints to the Leader.
-- Receives verification requests containing client public shares and encrypted Helper input shares.
-- Decrypts `input_share_2` using its private HPKE key.
-- Computes FLP proof verification state.
-- If verified, accumulates `input_share_2` into its local running aggregate share.
-- Maintains zero access to `input_share_1`.
+### C. Helper Aggregator Tier (Janus Instance 2)
+- Receives report shares forwarded by Leader.
+- Decrypts Share B using private HPKE key.
+- Verifies FLP proof consistency with Leader.
+- Accumulates verified Share B into its batch state.
+- Upon receiving `aggregate_shares` request with matching checksum from Leader, encrypts its accumulated aggregate share under the **Collector's public key** and returns it to the Leader.
 
-### D. Collector Tier (Blindmark Benchmark Collector)
-- When campaign batch window closes, initiates collection job across both aggregators.
-- Requests aggregate share $S_A$ from Leader and $S_B$ from Helper.
-- Validates that total count $M \ge N_{\min} = 20$.
-- Combines shares over finite field:
-  $$H_{\text{released}} = S_A + S_B \pmod p$$
-- Forwards final distribution to the Blindmark application backend.
+### D. Collector Tier (Blindmark Collector Engine)
+- Initiates collection jobs through the Leader.
+- Receives the paired encrypted aggregate shares from Leader.
+- Decrypts both aggregate shares using its private key.
+- Verifies cohort threshold ($M \ge 20$).
+- Executes VDAF `unshard` to recover final histogram frequencies.
+- Hands the verified distribution to the Blindmark backend via authenticated endpoint.
 
-### E. Blindmark Application Backend (Existing FastAPI & PostgreSQL)
-- Retains existing responsibility: community creation, campaign lifecycle, metadata management, and authenticated administrative operations.
-- Provisions task configurations in DAP aggregators via Janus Admin API.
-- Stores and displays **only aggregate histogram results** ($H_{\text{released}}$).
-
----
-
-## 4. Trust Model & Security Analysis
-
-### 4.1 Non-Collusion Invariant
-The fundamental privacy guarantee of DAP and Prio3 rests on the **two-aggregator non-collusion assumption**:
-$$\text{Leader and Helper must be operated by legally, operationally, and infrastructure-independent entities.}$$
-
-| Threat Scenario | System Outcome & Impact |
-| :--- | :--- |
-| **Malicious Leader** | **Privacy Preserved.** Leader only has Share 1. Without Share 2 (held encrypted or accumulated by Helper), Share 1 is uniformly random in the finite field. Leader cannot decrypt individual measurements. Leader can attempt denial of service or drop reports, but cannot forge valid client inputs without failing FLP verification. |
-| **Malicious Helper** | **Privacy Preserved.** Helper only has Share 2. Cannot reconstruct measurements. Cannot forge aggregate shares without causing unsharing failure if verified. |
-| **Colluding Aggregators** | **PRIVACY FAILS.** If Leader and Helper exchange their internal database shares or private HPKE keys, they can reconstruct every individual measurement in the batch. |
-| **Malicious Client** | **Integrity Preserved.** If client attempts to submit negative numbers, multiple buckets, or large scalars, the zero-knowledge FLP proof verification fails. The report is rejected during preparation and never enters the aggregate. |
-| **Replay & Sybil Attacks** | **DAP Deduplication + Eligibility:** DAP verifies report nonce uniqueness within the epoch. Client eligibility whitelisting ensures only authorized community members receive submission tokens. |
-| **Small Cohort Leakage** | **Protected by Threshold Gate:** The Collector strictly refuses to unshard or release results unless total participant count $M \ge 20$. |
+### E. Blindmark Application Backend (FastAPI)
+- Manages organizational accounts, communities, campaigns, and participant whitelists.
+- Exposes metadata to clients and provisions DAP task definitions in aggregators.
+- Ingests approved histogram benchmarks for display to authorized community members.
