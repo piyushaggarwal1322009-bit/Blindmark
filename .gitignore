@@ -6,3 +6,10 @@ node_modules/
 *.db
 .pytest_cache/
 
+
+# Rust build artifacts
+/experiments/rust_prio3_demo/target/
+
+
+# Ignore Rust build output in all projects
+**/target/
