@@ -64,3 +64,4 @@ The IETF Privacy-Preserving Measurement (PPM) Working Group specifies DAP (`draf
 - [ ] Implement clean web interface allowing users to select communities, authenticate via verified domains, and submit encrypted shares directly from the browser.
 - [ ] Deploy Aggregator A (Community Trustee) and Aggregator B (Independent Auditing Host) on separate infrastructure.
 - [ ] Execute first live pilot.
+

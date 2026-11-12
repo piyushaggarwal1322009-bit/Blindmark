@@ -1,0 +1,17 @@
+[package]
+name = "rust_prio3_demo"
+version = "0.1.0"
+edition = "2021"
+description = "Blindmark isolated Prio3Histogram verification and aggregation prototype"
+
+[dependencies]
+prio = "0.18.1-alpha.3"
+rand = "0.8"
+
+[lib]
+name = "rust_prio3_demo"
+path = "src/main.rs"
+
+[[bin]]
+name = "rust_prio3_demo"
+path = "src/main.rs"

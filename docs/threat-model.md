@@ -53,3 +53,4 @@
 * **Mitigation:**
   * **$k$-Anonymity Gate:** The Collector refuses to unshard or publish any batch where $N < N_{\text{min}}$ (e.g. minimum cohort size $\ge 20$).
   * **Differential Privacy:** Add controlled Laplacian noise ($\epsilon, \delta$) to output bucket counts to ensure individual participation cannot be reverse-engineered from public output.
+

@@ -1,0 +1,14 @@
+[package]
+name = "blindmark-phase-6e"
+version = "0.1.0"
+edition = "2021"
+description = "Blindmark Phase 6E: Rust Aggregator HTTP Services"
+[dependencies]
+blindmark-phase-6c = { path = "../phase_6c" }
+prio = "0.18.1-alpha.3"
+rand = "0.8"
+thiserror = "2"
+rusqlite = { version = "0.29", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_derive = "1.0"
+
