@@ -8,6 +8,8 @@ blindmark-phase-6c = { path = "../phase_6c" }
 prio = "0.18.1-alpha.3"
 rand = "0.8"
 thiserror = "2"
+hmac = "0.13.0"
+sha2 = "0.11.1"
 rusqlite = { version = "0.29", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_derive = "1.0"

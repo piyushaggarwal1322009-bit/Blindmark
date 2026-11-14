@@ -1,51 +1,37 @@
-//! SQLite storage foundation for Phase 6F.1 (Leader & Helper).
+//! SQLite storage foundation for Phase 6F.1 (Leader & Helper).
 //!
-//! This module implements a minimal, **durable** storage layer using SQLite
-//! in WAL mode.  It provides:
-//!   * Database initialization with required pragmas.
-//!   * Schema migrations for the tables required by the specification.
-//!   * A transactional `commit_report` that performs exact row‑count checks,
-//!     idempotent handling, and requires a durable `COMMIT_DECIDED` batch
-//!     decision before a Helper may commit.
-//!   * Deterministic aggregate reconstruction from only committed output shares.
+//! This module implements a minimal, durable storage layer using SQLite in WAL
+//! mode. It provides:
+//!   * database initialization with required pragmas;
+//!   * schema migrations for the minimal report/batch state used by the protocol;
+//!   * a transactional `commit_report` that enforces exact row counts and a
+//!     durable `COMMIT_DECIDED` batch decision;
+//!   * a prototype-only aggregate reconstruction that reads committed shares
+//!     exclusively and does not claim to be real Prio3 aggregation.
 //!
 //! The implementation stays inside the `blindmark-phase-6e` crate and does not
-//! touch any other phase.  It uses `rusqlite` (bundled SQLite) to avoid any
-//! external runtime dependencies.
+//! touch any other phase. It uses the bundled `rusqlite` SQLite library.
 
-use rusqlite::{params, Connection, Result, TransactionBehavior, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use std::path::Path;
 
-/// High‑level wrapper around a SQLite connection.
+/// High-level wrapper around a SQLite connection.
 #[derive(Debug)]
 pub struct Database {
     pub conn: Connection,
 }
 
 impl Database {
-    /// Open (or create) a SQLite database at `path`.
+    /// Open or create a SQLite database at `path`.
     ///
-    /// The function configures WAL mode, enables foreign keys, and runs the
-    /// schema migrations defined in `run_migrations`.
+    /// Database paths are caller-controlled and explicit.  The caller is
+    /// responsible for choosing an on-disk path when persistence is required.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        // If an in‑memory path is requested, use a temporary file instead so that
-        // WAL mode is supported. This satisfies the test expectations while
-        // preserving the intended semantics for production file paths.
-        let actual_path = if path.as_ref() == ":memory:" {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let mut temp = std::env::temp_dir();
-            temp.push(format!("blindmark_test_{}.db", ts));
-            temp
-        } else {
-            std::path::PathBuf::from(path.as_ref())
-        };
-        let conn = Connection::open(actual_path)?;
-        // Enable required pragmas.
+        let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", 2)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        // Run migrations.
+
         let db = Self { conn };
         db.run_migrations()?;
         Ok(db)
@@ -53,7 +39,8 @@ impl Database {
 
     /// Execute the full set of CREATE TABLE statements.
     fn run_migrations(&self) -> Result<()> {
-        self.conn.execute_batch(r#"
+        self.conn.execute_batch(
+            r#"
             PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = 2;
@@ -107,94 +94,155 @@ impl Database {
             BEGIN
                 SELECT RAISE(ABORT, 'cannot transition COMMIT_DECIDED to ABORTED');
             END;
-        "#)?;
+            "#,
+        )?;
         Ok(())
     }
 
     /// Verify that a batch has a durable `COMMIT_DECIDED` decision.
-    fn ensure_commit_decided(&self, batch_id: i64) -> Result<()> {
-        let mut stmt = self.conn.prepare("SELECT decision FROM batches WHERE id = ?1")?;
-        let decision: Option<String> = stmt
-            .query_row(params![batch_id], |row| row.get(0))
+    fn ensure_commit_decided_tx(tx: &Transaction<'_>, batch_id: i64) -> Result<()> {
+        let decision: Option<String> = tx
+            .query_row(
+                "SELECT decision FROM batches WHERE id = ?1",
+                params![batch_id],
+                |row| row.get(0),
+            )
             .optional()?;
+
         match decision.as_deref() {
             Some("COMMIT_DECIDED") => Ok(()),
             _ => Err(rusqlite::Error::InvalidQuery),
         }
     }
 
-    /// Commit a staged report to the `committed_output_shares` table.
+    /// Commit a staged report into the committed archive.
     ///
-    /// The function implements the exact‑row‑count checks required by the spec:
-    ///   * exactly one staged output share for the (report_id, batch_id)
-    ///   * exactly one `reports` row whose state transitions from `STAGED` to
-    ///     `COMMITTED`
-    ///   * one inserted committed share and one deleted staged share
-    /// If any check fails the transaction is rolled back.
-    ///
-    /// Idempotent handling:
-    ///   * If a committed record already exists for the same (report_id, batch_id)
-    ///     the function returns `Ok(())` without modifying the DB.
-    ///   * If a committed record exists with differing data, an error is raised.
+    /// This API intentionally uses only `(report_id, batch_id)` for idempotency.
+    /// It cannot verify payload equivalence on retry because the incoming share
+    /// bytes are not part of the API contract; therefore this function does not
+    /// claim byte-for-byte payload idempotency.
     pub fn commit_report(&mut self, report_id: i64, batch_id: i64) -> Result<()> {
-
-
-        // Check for any existing committed share for this report.
-        if let Some((existing_batch, existing_share)) = self
-            .conn
-            .query_row(
-                "SELECT batch_id, share FROM committed_output_shares WHERE report_id = ?1",
-                params![report_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()? {
-            if existing_batch == batch_id && existing_share == staged_share {
-                // Identical duplicate – idempotent success.
-                return Ok(());
-            } else {
-                // Conflict: same report already committed with different batch or content.
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-        }
-
-
-
-        // Verify exactly one staged row existed (query_row would error if 0 or >1).
-
-        // Ensure the batch decision is durable.
-        self.ensure_commit_decided(batch_id)?;
-
-        // Perform the staged‑to‑committed transition inside an IMMEDIATE transaction.
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        // Insert committed share (copy data).
-        tx.execute(
-            "INSERT INTO committed_output_shares (report_id, batch_id, share) VALUES (?1, ?2, ?3)",
-            params![report_id, batch_id, staged_share.clone()],
+        if let Err(err) = Self::ensure_commit_decided_tx(&tx, batch_id) {
+            tx.rollback()?;
+            return Err(err);
+        }
+
+        let report_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM reports WHERE id = ?1",
+            params![report_id],
+            |row| row.get(0),
         )?;
-        if tx.changes() != 1 {
+        if report_count != 1 {
             tx.rollback()?;
             return Err(rusqlite::Error::InvalidQuery);
         }
 
-        // Delete staged share.
-        tx.execute(
+        let report_row: (i64, String) = tx.query_row(
+            "SELECT batch_id, state FROM reports WHERE id = ?1",
+            params![report_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (report_batch_id, report_state) = report_row;
+
+        let committed_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM committed_output_shares WHERE report_id = ?1",
+            params![report_id],
+            |row| row.get(0),
+        )?;
+
+        if committed_count > 1 {
+            tx.rollback()?;
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        if committed_count == 1 {
+            let existing_batch: i64 = tx.query_row(
+                "SELECT batch_id FROM committed_output_shares WHERE report_id = ?1",
+                params![report_id],
+                |row| row.get(0),
+            )?;
+            let staged_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM staged_output_shares WHERE report_id = ?1",
+                params![report_id],
+                |row| row.get(0),
+            )?;
+
+            if existing_batch != batch_id
+                || report_batch_id != batch_id
+                || report_state != "COMMITTED"
+                || staged_count != 0
+            {
+                tx.rollback()?;
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+
+            tx.commit()?;
+            return Ok(());
+        }
+
+        if report_batch_id != batch_id {
+            tx.rollback()?;
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        if report_state != "STAGED" {
+            tx.rollback()?;
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        let other_staged_rows: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM staged_output_shares WHERE report_id = ?1 AND batch_id != ?2",
+            params![report_id, batch_id],
+            |row| row.get(0),
+        )?;
+        if other_staged_rows != 0 {
+            tx.rollback()?;
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        let staged_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM staged_output_shares WHERE report_id = ?1 AND batch_id = ?2",
+            params![report_id, batch_id],
+            |row| row.get(0),
+        )?;
+        if staged_count != 1 {
+            tx.rollback()?;
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        let staged_share: Vec<u8> = tx.query_row(
+            "SELECT share FROM staged_output_shares WHERE report_id = ?1 AND batch_id = ?2",
+            params![report_id, batch_id],
+            |row| row.get(0),
+        )?;
+
+        let inserted = tx.execute(
+            "INSERT INTO committed_output_shares (report_id, batch_id, share) VALUES (?1, ?2, ?3)",
+            params![report_id, batch_id, staged_share],
+        )?;
+        if inserted != 1 {
+            tx.rollback()?;
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        let deleted = tx.execute(
             "DELETE FROM staged_output_shares WHERE report_id = ?1 AND batch_id = ?2",
             params![report_id, batch_id],
         )?;
-        if tx.changes() != 1 {
+        if deleted != 1 {
             tx.rollback()?;
             return Err(rusqlite::Error::InvalidQuery);
         }
 
-        // Update report state from STAGED to COMMITTED.
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE reports SET state = 'COMMITTED' WHERE id = ?1 AND batch_id = ?2 AND state = 'STAGED'",
             params![report_id, batch_id],
         )?;
-        if tx.changes() != 1 {
+        if updated != 1 {
             tx.rollback()?;
             return Err(rusqlite::Error::InvalidQuery);
         }
@@ -203,26 +251,60 @@ impl Database {
         Ok(())
     }
 
-    /// Deterministic reconstruction of an aggregate for a given `task_id`.
-    /// This function reads only committed shares and returns a simple sum of
-    /// the raw bytes (placeholder for the real VDAF aggregation).
+    /// Prototype-only aggregate reconstruction for local recovery checks.
+    ///
+    /// This function reads only committed output shares and folds them with a
+    /// simple XOR placeholder. It is intentionally not a representation of real
+    /// Prio3 aggregation and must never be described as production VDAF output.
     pub fn rebuild_aggregate(&self, task_id: i64) -> Result<Vec<u8>> {
         let mut stmt = self.conn.prepare(
-            "SELECT share FROM committed_output_shares \n             JOIN reports ON committed_output_shares.report_id = reports.id \n             WHERE reports.task_id = ?1",
+            "SELECT committed_output_shares.report_id, committed_output_shares.batch_id, committed_output_shares.share, reports.batch_id AS report_batch_id, reports.state, batches.decision FROM committed_output_shares JOIN reports ON committed_output_shares.report_id = reports.id LEFT JOIN batches ON committed_output_shares.batch_id = batches.id WHERE reports.task_id = ?1 ORDER BY committed_output_shares.report_id ASC, committed_output_shares.batch_id ASC",
         )?;
+
         let mut aggregate: Vec<u8> = Vec::new();
+        let mut expected_len: Option<usize> = None;
         let mut rows = stmt.query(params![task_id])?;
+        let mut first_share_seen = false;
+
         while let Some(row) = rows.next()? {
-            let share: Vec<u8> = row.get(0)?;
-            // Placeholder aggregation: XOR all bytes together.
-            if aggregate.is_empty() {
+            let report_id: i64 = row.get(0)?;
+            let batch_id: i64 = row.get(1)?;
+            let share: Vec<u8> = row.get(2)?;
+            let report_batch_id: i64 = row.get(3)?;
+            let report_state: String = row.get(4)?;
+            let batch_decision: Option<String> = row.get(5)?;
+
+            if report_state != "COMMITTED" {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            if batch_id != report_batch_id {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            match batch_decision.as_deref() {
+                Some("COMMIT_DECIDED") => {}
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            }
+
+            if let Some(len) = expected_len {
+                if share.len() != len {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            } else {
+                expected_len = Some(share.len());
+            }
+
+            if !first_share_seen {
                 aggregate = share.clone();
+                first_share_seen = true;
             } else {
                 for (a, b) in aggregate.iter_mut().zip(share.iter()) {
                     *a ^= b;
                 }
             }
+
+            let _ = report_id;
         }
+
         Ok(aggregate)
     }
 }

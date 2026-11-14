@@ -10,6 +10,8 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 pub const DEFAULT_SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
+pub const MAX_HEADER_BYTES: usize = 16_384;
+pub const MAX_HEADER_COUNT: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -89,132 +91,144 @@ fn is_valid_header_value(val: &str) -> bool {
 }
 
 pub fn parse_request(stream: &mut TcpStream, max_payload_bytes: usize) -> Result<HttpRequest, (u16, String)> {
-    // Configure socket timeouts to prevent Slowloris attacks
     let _ = stream.set_read_timeout(Some(DEFAULT_SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(DEFAULT_SOCKET_TIMEOUT));
 
-    let mut buffer = [0u8; 4096];
-    let bytes_read = match stream.read(&mut buffer) {
-        Ok(0) => return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Empty HTTP request\"}".into())),
-        Ok(n) => n,
-        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
-            return Err((408, "{\"error\":\"RequestTimeout\",\"detail\":\"Socket read timed out\"}".into()));
+    let mut request_bytes = Vec::new();
+    let header_end = loop {
+        if let Some(position) = find_header_end(&request_bytes) {
+            let end = position + 4;
+            if end > MAX_HEADER_BYTES {
+                return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"HTTP headers exceed configured limit\"}".into()));
+            }
+            break end;
         }
-        Err(e) => {
-            return Err((400, format!("{{\"error\":\"ReadFailed\",\"detail\":\"{}\"}}", e)));
+        if request_bytes.len() >= MAX_HEADER_BYTES {
+            return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"HTTP headers exceed configured limit\"}".into()));
+        }
+
+        let mut chunk = [0u8; 4096];
+        let count = match stream.read(&mut chunk) {
+            Ok(0) if request_bytes.is_empty() => {
+                return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Empty HTTP request\"}".into()));
+            }
+            Ok(0) => {
+                return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Incomplete HTTP headers\"}".into()));
+            }
+            Ok(count) => count,
+            Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut || error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err((408, "{\"error\":\"RequestTimeout\",\"detail\":\"Socket read timed out\"}".into()));
+            }
+            Err(_) => {
+                return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Unable to read HTTP request\"}".into()));
+            }
+        };
+        request_bytes.extend_from_slice(&chunk[..count]);
+        if request_bytes.len() > MAX_HEADER_BYTES && find_header_end(&request_bytes).is_none() {
+            return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"HTTP headers exceed configured limit\"}".into()));
         }
     };
 
-    let req_str = match std::str::from_utf8(&buffer[..bytes_read]) {
-        Ok(s) => s,
-        Err(_) => return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Request headers must be valid ASCII/UTF-8\"}".into())),
-    };
-
-    let parts: Vec<&str> = req_str.split("\r\n\r\n").collect();
-    if parts.is_empty() {
-        return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Malformed HTTP headers\"}".into()));
+    let header_bytes = &request_bytes[..header_end - 4];
+    if !header_bytes.is_ascii() {
+        return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"HTTP headers must be ASCII\"}".into()));
     }
-
-    let header_part = parts[0];
-    let body_part = if parts.len() > 1 { parts[1] } else { "" };
-
-    let mut lines = header_part.lines();
-    let request_line = lines.next().ok_or((
-        400,
-        "{\"error\":\"BadRequest\",\"detail\":\"Missing request line\"}".into(),
-    ))?;
-    let mut req_line_parts = request_line.split_whitespace();
-    let method = req_line_parts.next().unwrap_or("GET").to_string();
-    let path = req_line_parts.next().unwrap_or("/").to_string();
+    let header_text = std::str::from_utf8(header_bytes)
+        .map_err(|_| (400, "{\"error\":\"BadRequest\",\"detail\":\"Invalid HTTP headers\"}".into()))?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().ok_or_else(|| {
+        (400, "{\"error\":\"BadRequest\",\"detail\":\"Missing request line\"}".into())
+    })?;
+    let request_parts: Vec<&str> = request_line.split(' ').collect();
+    if request_parts.len() != 3
+        || request_parts[0].is_empty()
+        || !request_parts[0].bytes().all(|byte| byte.is_ascii_uppercase())
+        || request_parts[1].is_empty()
+        || !request_parts[1].starts_with('/')
+        || !request_parts[1].bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        || request_parts[2] != "HTTP/1.1"
+    {
+        return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Invalid HTTP request line\"}".into()));
+    }
+    let method = request_parts[0].to_owned();
+    let path = request_parts[1].to_owned();
 
     let mut header_map: HashMap<String, String> = HashMap::new();
-    let mut seen_content_length = false;
-    let mut seen_transfer_encoding = false;
-
+    let mut header_count = 0usize;
     for line in lines {
-        let (raw_k, raw_v) = line.split_once(':').ok_or_else(|| {
+        if line.is_empty() {
+            return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Malformed HTTP headers\"}".into()));
+        }
+        header_count += 1;
+        if header_count > MAX_HEADER_COUNT {
+            return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Too many HTTP headers\"}".into()));
+        }
+        let (name, value) = line.split_once(':').ok_or_else(|| {
             (400, "{\"error\":\"BadRequest\",\"detail\":\"Malformed header line missing colon\"}".into())
         })?;
-
-        let k = raw_k.trim();
-        let v = raw_v.trim();
-
-        if !is_valid_header_name(k) {
-            return Err((400, format!("{{\"error\":\"BadRequest\",\"detail\":\"Invalid header name: {}\"}}", k)));
+        let value = value.trim_matches([' ', '\t']);
+        if !is_valid_header_name(name) || !is_valid_header_value(value) {
+            return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Invalid HTTP header\"}".into()));
         }
-        if !is_valid_header_value(v) {
-            return Err((400, format!("{{\"error\":\"BadRequest\",\"detail\":\"Invalid header value for: {}\"}}", k)));
+        let lower_name = name.to_ascii_lowercase();
+        if header_map.contains_key(&lower_name) {
+            let detail = if lower_name == "content-length" {
+                "Duplicate Content-Length header is forbidden"
+            } else {
+                "Duplicate HTTP header is forbidden"
+            };
+            return Err((400, format!("{{\"error\":\"BadRequest\",\"detail\":\"{}\"}}", detail)));
         }
-
-        let lower_k = k.to_ascii_lowercase();
-
-        if lower_k == "content-length" {
-            if seen_content_length {
-                return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Duplicate Content-Length header is forbidden\"}".into()));
-            }
-            seen_content_length = true;
-        }
-
-        if lower_k == "transfer-encoding" {
-            seen_transfer_encoding = true;
-        }
-
-        header_map.insert(lower_k, v.to_string());
+        header_map.insert(lower_name, value.to_owned());
     }
 
-    // RFC 9112 Section 6.3: Reject if both Transfer-Encoding and Content-Length are present
-    if seen_transfer_encoding && seen_content_length {
+    let has_content_length = header_map.contains_key("content-length");
+    let has_transfer_encoding = header_map.contains_key("transfer-encoding");
+    if has_transfer_encoding && has_content_length {
         return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Requests containing both Transfer-Encoding and Content-Length are forbidden\"}".into()));
     }
-
-    // RFC 9112: If Transfer-Encoding is present, check for chunked (or reject until fully implemented)
-    if seen_transfer_encoding {
+    if has_transfer_encoding {
         return Err((501, "{\"error\":\"NotImplemented\",\"detail\":\"Transfer-Encoding: chunked is not supported; use Content-Length\"}".into()));
     }
 
-    let content_length: usize = if let Some(val_str) = header_map.get("content-length") {
-        match val_str.parse::<usize>() {
-            Ok(val) => val,
-            Err(_) => return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Invalid numeric value in Content-Length header\"}".into())),
+    let content_length = match header_map.get("content-length") {
+        Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            value.parse::<usize>().map_err(|_| {
+                (400, "{\"error\":\"BadRequest\",\"detail\":\"Invalid Content-Length\"}".into())
+            })?
         }
-    } else {
-        body_part.len()
+        Some(_) => {
+            return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Invalid Content-Length\"}".into()));
+        }
+        None if method == "POST" => {
+            return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Content-Length is required for request bodies\"}".into()));
+        }
+        None => 0,
     };
-
     if content_length > max_payload_bytes {
-        return Err((
-            413,
-            format!(
-                "{{\"error\":\"PayloadTooLarge\",\"detail\":\"Payload length {} exceeds limit of {} bytes\"}}",
-                content_length, max_payload_bytes
-            ),
-        ));
+        return Err((413, "{\"error\":\"PayloadTooLarge\",\"detail\":\"Request body exceeds configured limit\"}".into()));
     }
 
-    let mut full_body = body_part.as_bytes().to_vec();
+    let prefetched_body = &request_bytes[header_end..];
+    if prefetched_body.len() > content_length {
+        return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Trailing bytes after request body\"}".into()));
+    }
+    let mut full_body = prefetched_body.to_vec();
     while full_body.len() < content_length {
-        let n = match stream.read(&mut buffer) {
+        let remaining = content_length - full_body.len();
+        let mut chunk = vec![0u8; remaining.min(4096)];
+        let count = match stream.read(&mut chunk) {
             Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(count) => count,
+            Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut || error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err((408, "{\"error\":\"RequestTimeout\",\"detail\":\"Timed out waiting for request body\"}".into()));
             }
-            Err(e) => {
-                return Err((400, format!("{{\"error\":\"BodyReadError\",\"detail\":\"{}\"}}", e)));
+            Err(_) => {
+                return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Unable to read request body\"}".into()));
             }
         };
-        full_body.extend_from_slice(&buffer[..n]);
-        if full_body.len() > max_payload_bytes {
-            return Err((
-                413,
-                format!(
-                    "{{\"error\":\"PayloadTooLarge\",\"detail\":\"Body exceeded limit of {} bytes\"}}",
-                    max_payload_bytes
-                ),
-            ));
-        }
+        full_body.extend_from_slice(&chunk[..count]);
     }
-
     if full_body.len() < content_length {
         return Err((400, "{\"error\":\"BadRequest\",\"detail\":\"Incomplete request body: client closed stream before Content-Length reached\"}".into()));
     }
@@ -225,6 +239,10 @@ pub fn parse_request(stream: &mut TcpStream, max_payload_bytes: usize) -> Result
         headers: header_map,
         body: full_body,
     })
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 pub fn write_response(stream: &mut TcpStream, resp: &HttpResponse) -> std::io::Result<()> {
