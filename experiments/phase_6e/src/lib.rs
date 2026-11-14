@@ -13,4 +13,6 @@ pub mod leader_service;
 pub mod helper_service;
 pub mod collector_service;
 pub mod storage;
+pub mod protocol;
+pub mod journal;
 

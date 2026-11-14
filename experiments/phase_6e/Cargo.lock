@@ -57,11 +57,13 @@ name = "blindmark-phase-6e"
 version = "0.1.0"
 dependencies = [
  "blindmark-phase-6c",
+ "hmac",
  "prio",
  "rand 0.8.8",
  "rusqlite",
  "serde",
  "serde_derive",
+ "sha2",
  "thiserror",
 ]
 
